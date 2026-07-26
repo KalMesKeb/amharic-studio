@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amharic-studio"
+version = "0.1.0"
+description = "Offline digitization and correction studio for badly OCR'd Amharic (Ge'ez script) books"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Amharic Studio contributors" }]
+keywords = ["amharic", "ethiopic", "geez", "ocr", "epub", "pdf", "digitization"]
+
+# Everything here is permissively licensed and works fully offline.
+# Deliberately excluded: PyMuPDF (AGPL), WeasyPrint (needs GTK on Windows).
+dependencies = [
+    "PySide6>=6.6",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "reportlab>=4.0",
+    "pypdfium2>=4.20",
+    "fonttools>=4.40",
+    "regex>=2023.0",
+]
+
+[project.optional-dependencies]
+# Image preprocessing: deskew, binarization, despeckle.
+imaging = ["opencv-python-headless>=4.8", "scipy>=1.10"]
+# Statistical language modelling for candidate ranking.
+lm = ["kenlm>=0.2"]
+# Neural post-OCR correction (CPU inference).
+neural = ["onnxruntime>=1.16"]
+dev = ["pytest>=7.4", "pytest-qt>=4.2", "ruff>=0.1"]
+
+[project.scripts]
+amharic-studio = "amharic_studio.app:main"
+
+[project.gui-scripts]
+amharic-studio-gui = "amharic_studio.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+amharic_studio = ["resources/**/*", "data/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

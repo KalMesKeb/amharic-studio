@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local model weights and downloaded corpora (never committed, always offline)
+models/
+src/amharic_studio/data/lexicon/*.db
+src/amharic_studio/resources/fonts/*.ttf
+src/amharic_studio/resources/fonts/*.otf
+
+# User projects
+*.amproj/
+scratch/
