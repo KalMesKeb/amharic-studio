@@ -81,6 +81,29 @@ class TestText:
         assert raw == "ሰላም ለሁሉም"
         assert edited == "ሠላም ተስተካክሏል", "re-running OCR must not discard corrections"
 
+    def test_re_recognizing_an_untouched_page_updates_what_you_see(self, project: Project):
+        """Re-running OCR has to change the editor, or it looks like it did nothing.
+
+        Seeding the working copy only when it is empty is not enough: after the first
+        recognition it is never empty again. A book imported with a junk text layer would
+        keep showing the junk no matter how many times it was recognized.
+        """
+        page_id = add_page(project)
+        project.set_raw_text(page_id, "Scanned by CamScanner")
+        project.set_raw_text(page_id, "ሰላም ለሁሉም")
+        raw, edited = project.get_text(page_id)
+        assert raw == "ሰላም ለሁሉም"
+        assert edited == "ሰላም ለሁሉም"
+
+    def test_re_recognizing_a_corrected_page_keeps_the_correction(self, project: Project):
+        page_id = add_page(project)
+        project.set_raw_text(page_id, "ሰላም")
+        project.set_edited_text(page_id, "ሠላም ተስተካክሏል")
+        project.set_raw_text(page_id, "ሰላም ለሁሉም")
+        raw, edited = project.get_text(page_id)
+        assert raw == "ሰላም ለሁሉም"
+        assert edited == "ሠላም ተስተካክሏል", "re-running OCR must not discard corrections"
+
     def test_an_edit_does_not_destroy_the_original_ocr(self, project: Project):
         # The scan-versus-text comparison and the training data both depend on this.
         page_id = add_page(project)

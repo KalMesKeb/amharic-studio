@@ -513,17 +513,24 @@ class Project:
         return edited or raw
 
     def set_raw_text(self, page_id: int, text: str, seed_edited: bool = True) -> None:
-        """Store recognizer output. The edited copy starts as a duplicate of it."""
+        """Store recognizer output, keeping the working copy in step with it.
+
+        The working copy follows the recognizer until the reader actually changes
+        something, and is then left alone forever. Seeding it only when it is *empty* is
+        not enough: after the first recognition it is never empty again, so re-running
+        OCR with better settings would update the raw text while the editor carried on
+        showing the old reading. A copy still identical to the previous raw text has not
+        been touched by anyone, which is the distinction that matters.
+        """
         now = time.time()
         with self.lock:
             row = self.conn.execute(
-                "SELECT edited_text FROM page_text WHERE page_id = ?", (page_id,)
+                "SELECT raw_text, edited_text FROM page_text WHERE page_id = ?", (page_id,)
             ).fetchone()
-            edited = (
-                text
-                if (seed_edited and (row is None or not row["edited_text"]))
-                else row["edited_text"]
+            untouched = (
+                row is None or not row["edited_text"] or row["edited_text"] == row["raw_text"]
             )
+            edited = text if (seed_edited and untouched) else row["edited_text"]
             self.conn.execute(
                 """
                 INSERT INTO page_text(page_id, raw_text, edited_text, updated_at)

@@ -46,6 +46,7 @@ class ImportReport:
     pages_added: int = 0
     kind: SourceKind = SourceKind.IMAGES
     text_layer_chars: int = 0
+    probe: TextLayerProbe | None = None
     warnings: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -56,7 +57,17 @@ class ImportReport:
         base = f"{self.pages_added} page{'s' if self.pages_added != 1 else ''} imported ({self.kind.value})"
         if self.text_layer_chars:
             base += f", {self.text_layer_chars:,} characters recovered from the text layer"
+        if self.probe is not None and self.probe.reason:
+            base += f". {self.probe.reason}"
         return base
+
+    @property
+    def needs_recognition(self) -> bool:
+        """True when pages came in as images and no text has been read for them yet."""
+        return self.pages_added > 0 and self.kind in (
+            SourceKind.IMAGES,
+            SourceKind.PDF_SCANNED,
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -131,19 +142,140 @@ def _store_derived_images(
 # --------------------------------------------------------------------------------------
 
 
-def probe_pdf(path: str | Path) -> tuple[int, bool, int]:
-    """Return ``(page_count, has_text_layer, sampled_characters)`` without importing."""
+#: A transcription of an Amharic page is written in Ethiopic. Scanner stamps, watermarks
+#: and channel handles ("Scanned by CamScanner", "t.me/…") are pure ASCII, and they are
+#: the usual reason an image-only PDF appears to already carry text. Set low rather than
+#: at a majority so a book with Latin front matter or heavy citation still qualifies.
+MIN_ETHIOPIC_RATIO = 0.30
+
+#: A real page of a book runs to hundreds of characters. A stamp runs to a couple of
+#: dozen, and that is the whole distinction being drawn here.
+MIN_CHARS_PER_PAGE = 120
+
+#: A line printed on this fraction of the sampled pages is furniture, not content.
+BOILERPLATE_SHARE = 0.6
+
+
+@dataclass
+class TextLayerProbe:
+    """What a PDF's existing text layer actually contains.
+
+    Deciding whether to trust a text layer by counting its characters is how a two-line
+    scanner watermark gets imported as the transcription of a 78-page book — and because
+    that marks every page as recognized, it also stops OCR from ever running. So the
+    question is not "is there text" but "is this text a transcription of these pages".
+    """
+
+    pages: int = 0
+    sampled: int = 0
+    chars_per_page: float = 0.0
+    ethiopic_ratio: float = 0.0
+    boilerplate: tuple[str, ...] = ()
+    usable: bool = False
+    reason: str = ""
+
+    def describe(self) -> str:
+        return self.reason
+
+
+def _sample_indices(count: int, sample: int = 8) -> list[int]:
+    """Spread the sample through the book.
+
+    Taking the first few pages reads the cover, the title page and whatever blank leaf
+    follows — the least representative pages in any scan.
+    """
+    if count <= sample:
+        return list(range(count))
+    step = count / sample
+    return sorted({min(count - 1, int(i * step)) for i in range(sample)})
+
+
+def _ethiopic_ratio(text: str) -> float:
+    """Share of the letters that are Ethiopic. Digits and punctuation do not vote."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters if "\u1200" <= c <= "\u137f" or "\u2d80" <= c <= "\u2dde") / len(
+        letters
+    )
+
+
+def _find_boilerplate(pages: Sequence[str], share: float = BOILERPLATE_SHARE) -> tuple[str, ...]:
+    """Lines that recur across pages: watermarks, running heads, channel stamps."""
+    if len(pages) < 3:
+        return ()
+    counts: dict[str, int] = {}
+    for text in pages:
+        for line in {ln.strip() for ln in text.splitlines() if ln.strip()}:
+            counts[line] = counts.get(line, 0) + 1
+    threshold = max(3, int(len(pages) * share))
+    return tuple(sorted(line for line, n in counts.items() if n >= threshold))
+
+
+def _strip_boilerplate(text: str, boilerplate: Iterable[str]) -> str:
+    drop = {b.strip() for b in boilerplate}
+    if not drop:
+        return text
+    return "\n".join(ln for ln in text.splitlines() if ln.strip() not in drop)
+
+
+def probe_pdf(path: str | Path, sample: int = 8) -> TextLayerProbe:
+    """Judge whether a PDF's text layer is worth importing, without importing it."""
     import pypdfium2 as pdfium
 
     pdf = pdfium.PdfDocument(str(path))
     try:
-        count = len(pdf)
-        sampled = 0
-        for index in range(min(count, 5)):
-            sampled += len(_page_text(pdf[index]))
-        return count, sampled > 40, sampled
+        return _probe_text_layer(pdf, _sample_indices(len(pdf), sample), len(pdf))
     finally:
         pdf.close()
+
+
+def _probe_text_layer(pdf: object, indices: Sequence[int], pages: int) -> TextLayerProbe:
+    texts = [_page_text(pdf[i]) for i in indices]  # type: ignore[index]
+    probe = TextLayerProbe(pages=pages, sampled=len(texts))
+    if not texts:
+        probe.reason = "The file has no pages."
+        return probe
+
+    probe.boilerplate = _find_boilerplate(texts)
+    content = [_strip_boilerplate(t, probe.boilerplate).strip() for t in texts]
+    if not any(content):
+        # Every line repeated on every page, so there was no contrast to separate
+        # furniture from content — sampled pages that are genuine duplicates look exactly
+        # like a page that is nothing but a stamp. Judge the text as it stands instead;
+        # a stamp is still far too short to pass, and a real page still passes.
+        content = [t.strip() for t in texts]
+    joined = "\n".join(content)
+
+    probe.chars_per_page = len(joined) / len(texts)
+    probe.ethiopic_ratio = _ethiopic_ratio(joined)
+
+    if probe.chars_per_page < MIN_CHARS_PER_PAGE:
+        if probe.boilerplate:
+            probe.reason = (
+                f"The text layer is only a repeated stamp ({probe.boilerplate[0][:40]!r}); "
+                "the pages themselves will be recognized."
+            )
+        else:
+            probe.reason = (
+                f"The text layer holds about {probe.chars_per_page:.0f} characters per page, "
+                "too little to be a transcription; the pages will be recognized."
+            )
+        return probe
+
+    if probe.ethiopic_ratio < MIN_ETHIOPIC_RATIO:
+        probe.reason = (
+            f"The text layer is {probe.ethiopic_ratio:.0%} Ethiopic, so it is not a "
+            "transcription of an Amharic page; the pages will be recognized."
+        )
+        return probe
+
+    probe.usable = True
+    probe.reason = (
+        f"Using the existing text layer: about {probe.chars_per_page:.0f} characters per "
+        f"page, {probe.ethiopic_ratio:.0%} Ethiopic."
+    )
+    return probe
 
 
 def import_pdf(
@@ -159,10 +291,10 @@ def import_pdf(
 ) -> ImportReport:
     """Import a PDF.
 
-    ``use_text_layer`` defaults to autodetection: if the file already carries text, that
-    text is imported as the recognizer output to be repaired, along with word boxes read
-    from the PDF itself. Pass ``False`` to ignore it and re-OCR from the rendered images,
-    which is usually better when the existing layer is very poor.
+    ``use_text_layer`` defaults to autodetection: if the file already carries a plausible
+    transcription, that text is imported as the recognizer output to be repaired, along
+    with word boxes read from the PDF itself. Pass ``False`` to ignore it and re-OCR from
+    the rendered images, or ``True`` to force it.
     """
     import pypdfium2 as pdfium
 
@@ -172,9 +304,13 @@ def import_pdf(
         indices = list(page_range) if page_range is not None else list(range(len(pdf)))
         total = len(indices)
 
+        sampled = [indices[i] for i in _sample_indices(len(indices))]
+        probe = _probe_text_layer(pdf, sampled, len(pdf))
+        report.probe = probe
         if use_text_layer is None:
-            sample = sum(len(_page_text(pdf[i])) for i in indices[:5])
-            use_text_layer = sample > 40
+            use_text_layer = probe.usable
+        # Even a genuine text layer carries the scanner's stamp on every page.
+        boilerplate = probe.boilerplate if use_text_layer else ()
         report.kind = SourceKind.PDF_TEXT_LAYER if use_text_layer else SourceKind.PDF_SCANNED
 
         scale = dpi / 72.0
@@ -201,7 +337,7 @@ def import_pdf(
                 _store_derived_images(project, page.id, image, options, apply_preprocessing, dpi)
 
             if use_text_layer:
-                chars = _import_text_layer(project, page.id, pdf_page, scale)
+                chars = _import_text_layer(project, page.id, pdf_page, scale, boilerplate)
                 report.text_layer_chars += chars
                 if chars:
                     project.set_page_status(page.id, PageStatus.RECOGNIZED)
@@ -227,7 +363,13 @@ def _page_text(pdf_page: object) -> str:
         textpage.close()
 
 
-def _import_text_layer(project: Project, page_id: int, pdf_page: object, scale: float) -> int:
+def _import_text_layer(
+    project: Project,
+    page_id: int,
+    pdf_page: object,
+    scale: float,
+    boilerplate: Iterable[str] = (),
+) -> int:
     """Pull text and per-character boxes out of a PDF, and group them into word boxes.
 
     PDF character boxes are in points with the origin at the bottom left; the rendered
@@ -260,6 +402,7 @@ def _import_text_layer(project: Project, page_id: int, pdf_page: object, scale: 
             boxes = []
 
         words = _words_from_charboxes(boxes, page_height, scale) if boxes else []
+        words = _drop_boilerplate_words(words, boilerplate)
         if words:
             rebuilt = assemble_text(words)
             project.set_raw_text(page_id, rebuilt)
@@ -281,10 +424,31 @@ def _import_text_layer(project: Project, page_id: int, pdf_page: object, scale: 
             )
             return len(rebuilt)
 
+        text = _strip_boilerplate(text, boilerplate).strip()
+        if not text:
+            return 0
         project.set_raw_text(page_id, text)
         return len(text)
     finally:
         textpage.close()
+
+
+def _drop_boilerplate_words(words: list[OcrWord], boilerplate: Iterable[str]) -> list[OcrWord]:
+    """Remove whole lines that match a known stamp, and close the gap in the numbering."""
+    drop = {b.strip() for b in boilerplate if b.strip()}
+    if not drop or not words:
+        return words
+
+    keep_lines = {
+        line.line_idx for line in lines_from_words(words) if line.text.strip() not in drop
+    }
+    kept = [w for w in words if w.line_idx in keep_lines]
+
+    # line_idx is used as a dense index downstream, so it has to be renumbered.
+    renumbered = {old: new for new, old in enumerate(sorted(keep_lines))}
+    for word in kept:
+        word.line_idx = renumbered[word.line_idx]
+    return kept
 
 
 def _words_from_charboxes(

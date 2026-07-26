@@ -523,9 +523,23 @@ class MainWindow(QMainWindow):
         pages = self.project.pages()
         if pages and self.current_page_id is None:
             self.load_page(pages[0].id)
-        self.statusBar().showMessage(report.describe(), 8000)
+        self.statusBar().showMessage(report.describe(), 12000)
         if report.warnings:
             QMessageBox.warning(self, "Import warnings", "\n".join(report.warnings[:20]))
+
+        if report.needs_recognition:
+            # These pages are images with no text yet, and the point of importing them is
+            # to read them. Asking here saves discovering the empty editor page by page.
+            detail = report.probe.reason if report.probe is not None else ""
+            answer = QMessageBox.question(
+                self,
+                "Recognize now?",
+                f"{report.pages_added} pages were imported as scans."
+                + (f"\n\n{detail}" if detail else "")
+                + "\n\nRun OCR over them now?",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.recognize_pages()
 
     def recognize_pages(self) -> None:
         if self.project is None or self.pipeline is None:
